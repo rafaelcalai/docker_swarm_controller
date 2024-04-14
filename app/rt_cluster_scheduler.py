@@ -11,10 +11,77 @@ logging.basicConfig(
 )
 
 
+def get_node_info():
+    nodes = client.nodes.list()
+
+    node_info = []
+
+    for node in nodes:
+        node_data = {
+            "ID": node.id,
+            "Name": node.attrs["Description"]["Hostname"],
+            "Status": node.attrs["Status"]["State"],
+            "Role": node.attrs["Spec"]["Role"],
+            "Availability": node.attrs["Spec"]["Availability"],
+            "Platform": node.attrs["Description"]["Platform"]["Architecture"],
+        }
+
+        # Retrieve memory and CPU usage if available
+        if "Description" in node.attrs and "Resources" in node.attrs["Description"]:
+            resources = node.attrs["Description"]["Resources"]
+            if "NanoCPUs" in resources:
+                node_data["CPU"] = (
+                    resources["NanoCPUs"] / 1e9
+                )  # Convert from nanocpus to CPUs
+            if "MemoryBytes" in resources:
+                node_data["Memory"] = resources["MemoryBytes"] / (
+                    1024 * 1024
+                )  # Convert from bytes to MB
+
+        node_info.append(node_data)
+
+    return node_info
+
+
 def create_service(service_name, image, constraints=None, secrets=None, command=None):
     constraints = constraints or []
     secrets = secrets or []
     command = command or []
+
+    services_associated = dict()
+
+    for service in client.services.list():
+        print(
+            "### Service - ",
+            service.id,
+            service.name,
+            service.attrs["Spec"]["TaskTemplate"]["Placement"]["Constraints"][
+                0
+            ].replace("node.hostname == ", ""),
+        )
+
+    nodes = client.nodes.list()
+    nodes_name_list = []
+    for node in nodes:
+        print(node.attrs["Description"]["Hostname"], node.attrs["Status"]["State"])
+        if node.attrs["Status"]["State"] == "ready":
+            nodes_name_list.append(node.attrs["Description"]["Hostname"])
+
+    print(nodes_name_list)
+
+    services_associated = dict()
+    for service in client.services.list():
+        node_name = service.attrs["Spec"]["TaskTemplate"]["Placement"]["Constraints"][
+            0
+        ].replace("node.hostname == ", "")
+        my_service_name = service.name
+
+        if node_name not in services_associated:
+            services_associated[node_name] = []
+
+        services_associated[node_name].append(my_service_name)
+    print(services_associated)
+
     return client.services.create(
         name=service_name,
         image=image,
