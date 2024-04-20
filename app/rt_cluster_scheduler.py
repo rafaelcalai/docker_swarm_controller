@@ -52,7 +52,6 @@ def get_available_worker_nodes(worker_nodes):
         if node.attrs["Status"]["State"] == "ready" and node_name in worker_nodes:
             available_worker_nodes.append(node_name)
 
-    print(available_worker_nodes)
     return available_worker_nodes
 
 
@@ -92,14 +91,19 @@ def create_service(
     secrets = secrets or []
     command = command or []
 
+    resources = {
+        "Limits": {
+            "NanoCPUs": int(1 * 1e9),  # Convert CPU to NanoCPUs
+            "MemoryBytes": int(256 * 1e6),  # Convert MB to Bytes
+        }
+    }
+
     available_worker_nodes = get_available_worker_nodes(worker_nodes)
     services_associated = get_worker_nodes_load()
     work_node = load_balance(available_worker_nodes, services_associated)
     constraints = [f"node.hostname == {work_node}"]
 
-    logging.info(
-        f"Service {service_name} with Image: {image} and Constraints: {constraints} created!"
-    )
+    logging.info(f"Service {service_name} with Constraints: {constraints} created!")
     return client.services.create(
         name=service_name,
         image=image,
@@ -107,6 +111,7 @@ def create_service(
         secrets=secrets,
         command=command,
         restart_policy={"Condition": "none"},
+        resources=resources,
     )
 
 
@@ -132,7 +137,6 @@ def remove_service_thread(thread):
 
 def create_service_thread(thread):
     image_name = "rafaelcalai633/wait-for-value"
-    command = ["python", "wait_for_value.py", "5"]
     constraints = ["node.hostname == rpi5-node01"]
 
     PORT = 8767
@@ -160,6 +164,11 @@ def create_service_thread(thread):
             if data:
                 task_request = eval(data)
                 service_name = task_request["task_name"]
+                command = [
+                    "python",
+                    "wait_for_value.py",
+                    str(task_request["ecxecution_time"]),
+                ]
 
                 service = create_service(
                     service_name,
