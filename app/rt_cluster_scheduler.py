@@ -3,6 +3,7 @@ import logging
 import threading
 import time
 import socket
+import json
 
 
 client = docker.from_env()
@@ -43,32 +44,19 @@ def get_node_info():
     return node_info
 
 
-def create_service(service_name, image, constraints=None, secrets=None, command=None):
-    constraints = constraints or []
-    secrets = secrets or []
-    command = command or []
-
-    services_associated = dict()
-
-    for service in client.services.list():
-        print(
-            "### Service - ",
-            service.id,
-            service.name,
-            service.attrs["Spec"]["TaskTemplate"]["Placement"]["Constraints"][
-                0
-            ].replace("node.hostname == ", ""),
-        )
-
+def get_available_worker_nodes(worker_nodes):
     nodes = client.nodes.list()
-    nodes_name_list = []
+    available_worker_nodes = []
     for node in nodes:
-        print(node.attrs["Description"]["Hostname"], node.attrs["Status"]["State"])
-        if node.attrs["Status"]["State"] == "ready":
-            nodes_name_list.append(node.attrs["Description"]["Hostname"])
+        node_name = node.attrs["Description"]["Hostname"]
+        if node.attrs["Status"]["State"] == "ready" and node_name in worker_nodes:
+            available_worker_nodes.append(node_name)
 
-    print(nodes_name_list)
+    print(available_worker_nodes)
+    return available_worker_nodes
 
+
+def get_worker_nodes_load():
     services_associated = dict()
     for service in client.services.list():
         node_name = service.attrs["Spec"]["TaskTemplate"]["Placement"]["Constraints"][
@@ -80,8 +68,38 @@ def create_service(service_name, image, constraints=None, secrets=None, command=
             services_associated[node_name] = []
 
         services_associated[node_name].append(my_service_name)
-    print(services_associated)
+    return services_associated
 
+
+def load_balance(available_worker_nodes, services_associated):
+    least_work_node = ""
+    max_services_associated = 255
+    for node in available_worker_nodes:
+        if node not in services_associated:
+            least_work_node = node
+            max_services_associated = 0
+        else:
+            if len(services_associated[node]) < max_services_associated:
+                least_work_node = node
+                max_services_associated = len(services_associated[node])
+    return least_work_node
+
+
+def create_service(
+    service_name, image, constraints=None, secrets=None, command=None, worker_nodes=[]
+):
+    constraints = constraints or []
+    secrets = secrets or []
+    command = command or []
+
+    available_worker_nodes = get_available_worker_nodes(worker_nodes)
+    services_associated = get_worker_nodes_load()
+    work_node = load_balance(available_worker_nodes, services_associated)
+    constraints = [f"node.hostname == {work_node}"]
+
+    logging.info(
+        f"Service {service_name} with Image: {image} and Constraints: {constraints} created!"
+    )
     return client.services.create(
         name=service_name,
         image=image,
@@ -127,6 +145,12 @@ def create_service_thread(thread):
     logging.info("socket is listening")
     thread = 0
 
+    with open("config.json", encoding="utf-8") as f:
+        config_data = json.load(f)
+
+    WORKER_NODES = config_data["nodes"]["worker_nodes"]
+    MANAGER_NODES = config_data["nodes"]["manager_nodes"]
+
     while True:
         connection, addr = server.accept()
         logging.info(f"Connetion from {addr}")
@@ -138,9 +162,12 @@ def create_service_thread(thread):
                 service_name = task_request["task_name"]
 
                 service = create_service(
-                    service_name, image_name, constraints=constraints, command=command
+                    service_name,
+                    image_name,
+                    constraints=constraints,
+                    command=command,
+                    worker_nodes=WORKER_NODES,
                 )
-                logging.info(f"Service {service_name} created!")
                 break
 
 

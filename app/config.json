@@ -1,0 +1,11 @@
+{
+    "nodes": {
+        "worker_nodes": [
+            "rpi5-node01",
+            "rpi3-node02"
+        ],
+        "manager_nodes": [
+            "rpi5-calai02-controller"
+        ]
+    }
+}
