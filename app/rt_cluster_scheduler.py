@@ -136,7 +136,7 @@ def remove_service_thread(thread):
 
 
 def create_service_thread(thread):
-    image_name = "rafaelcalai633/wait-for-value"
+    image_name = "rafaelcalai633/wait-for-value:1.1.0"
     constraints = ["node.hostname == rpi5-node01"]
 
     PORT = 8767
@@ -168,6 +168,7 @@ def create_service_thread(thread):
                     "python",
                     "wait_for_value.py",
                     str(task_request["ecxecution_time"]),
+                    service_name
                 ]
 
                 service = create_service(
