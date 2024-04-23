@@ -14,7 +14,6 @@ logging.basicConfig(
 
 def get_node_info():
     nodes = client.nodes.list()
-
     node_info = []
 
     for node in nodes:
@@ -168,7 +167,7 @@ def create_service_thread(thread):
                     "python",
                     "wait_for_value.py",
                     str(task_request["ecxecution_time"]),
-                    service_name
+                    service_name,
                 ]
 
                 service = create_service(
