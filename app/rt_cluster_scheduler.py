@@ -4,12 +4,15 @@ import threading
 import time
 import socket
 import json
-
+from collections import deque
 
 client = docker.from_env()
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
+
+sched_queue = deque()
+sched_queue_lock = threading.Lock()
 
 
 def get_node_info():
@@ -69,24 +72,39 @@ def get_worker_nodes_load():
     return services_associated
 
 
-def load_balance(available_worker_nodes, services_associated):
+def load_balance(available_worker_nodes, services_associated, service_limit):
     least_work_node = ""
     max_services_associated = 255
     for node in available_worker_nodes:
         if node not in services_associated:
             least_work_node = node
-            max_services_associated = 0
+            break
         else:
-            if len(services_associated[node]) < max_services_associated:
+            if (
+                len(services_associated[node]) < max_services_associated
+                and len(services_associated[node]) < service_limit[node]
+            ):
                 least_work_node = node
                 max_services_associated = len(services_associated[node])
     return least_work_node
 
 
-def create_service(
-    service_name, image, constraints=None, secrets=None, command=None, worker_nodes=[]
-):
-    constraints = constraints or []
+def check_schedulability(worker_nodes, service_limit):
+    available_worker_nodes = get_available_worker_nodes(worker_nodes)
+    services_associated = get_worker_nodes_load()
+    work_node = load_balance(available_worker_nodes, services_associated, service_limit)
+    return work_node
+
+
+def create_service(service_name, work_node, task_request, secrets=None):
+    image_name = "rafaelcalai633/wait-for-value:1.1.0"
+    constraints = ["node.hostname == rpi5-node01"]
+    command = [
+        "python",
+        "wait_for_value.py",
+        str(task_request["ecxecution_time"]),
+        service_name,
+    ]
     secrets = secrets or []
     command = command or []
 
@@ -97,15 +115,12 @@ def create_service(
         }
     }
 
-    available_worker_nodes = get_available_worker_nodes(worker_nodes)
-    services_associated = get_worker_nodes_load()
-    work_node = load_balance(available_worker_nodes, services_associated)
     constraints = [f"node.hostname == {work_node}"]
 
     logging.info(f"Service {service_name} with Constraints: {constraints} created!")
     return client.services.create(
         name=service_name,
-        image=image,
+        image=image_name,
         constraints=constraints,
         secrets=secrets,
         command=command,
@@ -120,24 +135,47 @@ def remove_service(service_id):
     try:
         service = client.services.get(service_id)
         service.remove()
-        logging.info(f"Service {service_id} removed.")
+        # logging.info(f"Service {service_id} removed.")
     except docker.errors.NotFound:
         logging.error(f"Service {service_id} not found.")
 
 
-def remove_service_thread(thread):
+def sched_service(worker_nodes, service_limit, task_request):
+    service_name = task_request["task_name"]
+
+    work_node = check_schedulability(worker_nodes, service_limit)
+
+    if work_node:
+        service = create_service(service_name, work_node, task_request)
+    else:
+        sched_queue_lock.acquire()
+        sched_queue.append(task_request)
+        sched_queue_lock.release()
+        logging.info(f"Cluster is busy, Service {service_name} was added to the queue")
+
+
+def remove_service_thread(thread, config_data):
+    worker_nodes = config_data["nodes"]["worker_nodes"]
+    service_limit = config_data["nodes"]["service_limit"]
+
     while True:
         for service in client.services.list():
             if service.tasks(filters={"desired-state": ["shutdown"]}):
                 logging.info(f"service stoped: {service.name}")
                 remove_service(service.id)
+                if sched_queue:
+                    sched_queue_lock.acquire()
+                    task_request = sched_queue.popleft()
+                    sched_queue_lock.release()
+
+                    logging.info(
+                        f"Creating a service from the sched queue: {task_request['task_name']}"
+                    )
+                    sched_service(worker_nodes, service_limit, task_request)
         time.sleep(0.1)
 
 
-def create_service_thread(thread):
-    image_name = "rafaelcalai633/wait-for-value:1.1.0"
-    constraints = ["node.hostname == rpi5-node01"]
-
+def listen_service_request(thread, config_data):
     PORT = 8767
     HOST = "0.0.0.0"
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -148,11 +186,8 @@ def create_service_thread(thread):
     logging.info("socket is listening")
     thread = 0
 
-    with open("config.json", encoding="utf-8") as f:
-        config_data = json.load(f)
-
-    WORKER_NODES = config_data["nodes"]["worker_nodes"]
-    MANAGER_NODES = config_data["nodes"]["manager_nodes"]
+    worker_nodes = config_data["nodes"]["worker_nodes"]
+    service_limit = config_data["nodes"]["service_limit"]
 
     while True:
         connection, addr = server.accept()
@@ -162,29 +197,26 @@ def create_service_thread(thread):
             data = connection.recv(1024)
             if data:
                 task_request = eval(data)
-                service_name = task_request["task_name"]
-                command = [
-                    "python",
-                    "wait_for_value.py",
-                    str(task_request["ecxecution_time"]),
-                    service_name,
-                ]
 
-                service = create_service(
-                    service_name,
-                    image_name,
-                    constraints=constraints,
-                    command=command,
-                    worker_nodes=WORKER_NODES,
-                )
+                sched_service(worker_nodes, service_limit, task_request)
                 break
 
 
 def main():
-    monitor_thread = threading.Thread(target=remove_service_thread, args=(1,))
-    server_thread = threading.Thread(target=create_service_thread, args=(1,))
+    with open("config.json", encoding="utf-8") as f:
+        config_data = json.load(f)
+
+    monitor_thread = threading.Thread(
+        target=remove_service_thread, args=(1, config_data)
+    )
+    server_thread = threading.Thread(
+        target=listen_service_request, args=(1, config_data)
+    )
     monitor_thread.start()
     server_thread.start()
+
+    monitor_thread.join()
+    server_thread.join()
 
 
 if __name__ == "__main__":

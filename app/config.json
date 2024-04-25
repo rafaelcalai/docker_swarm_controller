@@ -6,6 +6,10 @@
         ],
         "manager_nodes": [
             "rpi5-calai02-controller"
-        ]
+        ],
+        "service_limit": {
+            "rpi5-node01": 3,
+            "rpi3-node02": 2
+        }
     }
 }
