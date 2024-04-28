@@ -5,6 +5,7 @@ import time
 import socket
 import json
 from collections import deque
+from copy import deepcopy
 
 client = docker.from_env()
 logging.basicConfig(
@@ -75,7 +76,7 @@ def get_worker_nodes_load():
     return services_associated
 
 
-def load_balance(available_worker_nodes, services_associated, service_limit):
+def available_worker_node(available_worker_nodes, services_associated, service_limit):
     least_work_node = ""
     max_services_associated = 255
     for node in available_worker_nodes:
@@ -92,10 +93,60 @@ def load_balance(available_worker_nodes, services_associated, service_limit):
     return least_work_node
 
 
-def check_schedulability(worker_nodes, service_limit):
+def pause_lower_priority_service(task_priority, worker_node_addresses):
+    running_services_lock.acquire()
+    copy_running_services = deepcopy(running_services)
+    running_services_lock.release()
+
+    lowest_priority_service = ""
+    available_worker_node = ""
+    lowest_priority = task_priority
+    for service in copy_running_services:
+        print(copy_running_services[service]["priority"])
+        if copy_running_services[service]["priority"] > lowest_priority:
+            lowest_priority = copy_running_services[service]["priority"]
+            lowest_priority_service = service
+            available_worker_node = copy_running_services[service]["work_node"]
+
+    if available_worker_node:
+        pause_service_containers(
+            lowest_priority_service, worker_node_addresses[available_worker_node]
+        )
+
+    return available_worker_node
+
+
+def load_balance(
+    available_worker_nodes,
+    services_associated,
+    service_limit,
+    task_request,
+    worker_node_addresses,
+):
+
+    worker_node = available_worker_node(
+        available_worker_nodes, services_associated, service_limit
+    )
+    if worker_node == "":
+        worker_node = pause_lower_priority_service(
+            task_request["priority"], worker_node_addresses
+        )
+
+    return worker_node
+
+
+def check_schedulability(
+    worker_nodes, service_limit, task_request, worker_node_addresses
+):
     available_worker_nodes = get_available_worker_nodes(worker_nodes)
     services_associated = get_worker_nodes_load()
-    work_node = load_balance(available_worker_nodes, services_associated, service_limit)
+    work_node = load_balance(
+        available_worker_nodes,
+        services_associated,
+        service_limit,
+        task_request,
+        worker_node_addresses,
+    )
     return work_node
 
 
@@ -119,6 +170,11 @@ def create_service(service_name, work_node, task_request, secrets=None):
     }
 
     constraints = [f"node.hostname == {work_node}"]
+    task_request["work_node"] = work_node
+
+    running_services_lock.acquire()
+    running_services[service_name] = task_request
+    running_services_lock.release()
 
     logging.info(f"Service {service_name} with Constraints: {constraints} created!")
     return client.services.create(
@@ -143,14 +199,28 @@ def remove_service(service_id):
         logging.error(f"Service {service_id} not found.")
 
 
-def pause_service_containers(service_id):
-    service_containers = client.services.get(service_id).tasks()
+def pause_service_containers(service_name, worker_node_address):
+    service = client.services.list(filters={"name": service_name})[0]
+    service_containers = service.tasks()
+
     for container in service_containers:
-        container_command = dict()
-        container_command["id"] = container["Status"]["ContainerStatus"]["ContainerID"]
-        container_command["command"] = "pause"
-        __send_message(container_command)
-    logging.info(f"Service {service_id} paused.")
+        if container["Status"]["State"] == "pending":
+            remove_service(service.id)
+            logging.info(f"Service {service_name} removed.")
+        else:
+            container_command = dict()
+            container_command["id"] = container["Status"]["ContainerStatus"][
+                "ContainerID"
+            ]
+            container_command["command"] = "pause"
+            __send_message(container_command, worker_node_address)
+            logging.info(f"Service {service_name} paused.")
+
+    running_services_lock.acquire()
+    if service_name in running_services:
+        del running_services[service_name]
+    running_services_lock.release()
+    print(running_services.keys())
 
 
 def unpause_service_containers(service_id):
@@ -164,9 +234,9 @@ def unpause_service_containers(service_id):
     logging.info(f"Service {service_id} unpaused.")
 
 
-def __send_message(container_command, host, port):
+def __send_message(container_command, host):
     client_socket = socket.socket()
-    client_socket.connect((host, port))
+    client_socket.connect((host, 8770))
 
     message = json.dumps(container_command)
 
@@ -174,10 +244,12 @@ def __send_message(container_command, host, port):
     client_socket.close()
 
 
-def sched_service(worker_nodes, service_limit, task_request):
+def sched_service(worker_nodes, service_limit, task_request, worker_node_addresses):
     service_name = task_request["task_name"]
 
-    work_node = check_schedulability(worker_nodes, service_limit)
+    work_node = check_schedulability(
+        worker_nodes, service_limit, task_request, worker_node_addresses
+    )
 
     if work_node:
         service = create_service(service_name, work_node, task_request)
@@ -196,6 +268,13 @@ def remove_service_thread(thread, config_data):
         for service in client.services.list():
             if service.tasks(filters={"desired-state": ["shutdown"]}):
                 logging.info(f"service stoped: {service.name}")
+
+                running_services_lock.acquire()
+                if service.name in running_services:
+                    del running_services[service.name]
+                running_services_lock.release()
+                print(running_services.keys())
+
                 remove_service(service.id)
                 if sched_queue:
                     sched_queue_lock.acquire()
@@ -222,6 +301,7 @@ def listen_service_request(thread, config_data):
 
     worker_nodes = config_data["nodes"]["worker_nodes"]
     service_limit = config_data["nodes"]["service_limit"]
+    worker_node_addresses = config_data["nodes"]["ip_address"]
 
     while True:
         connection, addr = server.accept()
@@ -232,7 +312,9 @@ def listen_service_request(thread, config_data):
             if data:
                 task_request = eval(data)
 
-                sched_service(worker_nodes, service_limit, task_request)
+                sched_service(
+                    worker_nodes, service_limit, task_request, worker_node_addresses
+                )
                 break
 
 
