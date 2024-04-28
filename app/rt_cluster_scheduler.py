@@ -11,6 +11,9 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+running_services = dict()
+running_services_lock = threading.Lock()
+
 sched_queue = deque()
 sched_queue_lock = threading.Lock()
 
@@ -138,6 +141,37 @@ def remove_service(service_id):
         # logging.info(f"Service {service_id} removed.")
     except docker.errors.NotFound:
         logging.error(f"Service {service_id} not found.")
+
+
+def pause_service_containers(service_id):
+    service_containers = client.services.get(service_id).tasks()
+    for container in service_containers:
+        container_command = dict()
+        container_command["id"] = container["Status"]["ContainerStatus"]["ContainerID"]
+        container_command["command"] = "pause"
+        __send_message(container_command)
+    logging.info(f"Service {service_id} paused.")
+
+
+def unpause_service_containers(service_id):
+    service_containers = client.services.get(service_id).tasks()
+    for container in service_containers:
+        container_command = dict()
+        container_command["id"] = container["Status"]["ContainerStatus"]["ContainerID"]
+        container_command["command"] = "unpause"
+        __send_message(container_command)
+
+    logging.info(f"Service {service_id} unpaused.")
+
+
+def __send_message(container_command, host, port):
+    client_socket = socket.socket()
+    client_socket.connect((host, port))
+
+    message = json.dumps(container_command)
+
+    client_socket.send(message.encode())
+    client_socket.close()
 
 
 def sched_service(worker_nodes, service_limit, task_request):
