@@ -61,18 +61,18 @@ def get_available_worker_nodes(worker_nodes):
     return available_worker_nodes
 
 
-def get_worker_nodes_load():
+def get_worker_nodes_load(available_worker_nodes):
     services_associated = dict()
-    for service in client.services.list():
-        node_name = service.attrs["Spec"]["TaskTemplate"]["Placement"]["Constraints"][
-            0
-        ].replace("node.hostname == ", "")
-        my_service_name = service.name
+    for worker_node in available_worker_nodes:
+        services_associated[worker_node] = list()
 
-        if node_name not in services_associated:
-            services_associated[node_name] = []
+    running_services_lock.acquire()
+    copy_running_services = deepcopy(running_services)
+    running_services_lock.release()
 
-        services_associated[node_name].append(my_service_name)
+    for service in copy_running_services:
+        services_associated[copy_running_services[service]["work_node"]].append(service)
+
     return services_associated
 
 
@@ -102,7 +102,6 @@ def pause_lower_priority_service(task_priority, worker_node_addresses):
     available_worker_node = ""
     lowest_priority = task_priority
     for service in copy_running_services:
-        print(copy_running_services[service]["priority"])
         if copy_running_services[service]["priority"] > lowest_priority:
             lowest_priority = copy_running_services[service]["priority"]
             lowest_priority_service = service
@@ -139,7 +138,8 @@ def check_schedulability(
     worker_nodes, service_limit, task_request, worker_node_addresses
 ):
     available_worker_nodes = get_available_worker_nodes(worker_nodes)
-    services_associated = get_worker_nodes_load()
+    services_associated = get_worker_nodes_load(available_worker_nodes)
+
     work_node = load_balance(
         available_worker_nodes,
         services_associated,
@@ -150,7 +150,9 @@ def check_schedulability(
     return work_node
 
 
-def create_service(service_name, work_node, task_request, secrets=None):
+def create_service(
+    service_name, work_node, task_request, worker_node_addresses, secrets=None
+):
     image_name = "rafaelcalai633/wait-for-value:1.1.0"
     constraints = ["node.hostname == rpi5-node01"]
     command = [
@@ -171,6 +173,8 @@ def create_service(service_name, work_node, task_request, secrets=None):
 
     constraints = [f"node.hostname == {work_node}"]
     task_request["work_node"] = work_node
+    task_request["service_state"] = "new"
+    task_request["work_node_ip"] = worker_node_addresses[work_node]
 
     running_services_lock.acquire()
     running_services[service_name] = task_request
@@ -194,7 +198,6 @@ def remove_service(service_id):
     try:
         service = client.services.get(service_id)
         service.remove()
-        # logging.info(f"Service {service_id} removed.")
     except docker.errors.NotFound:
         logging.error(f"Service {service_id} not found.")
 
@@ -202,11 +205,16 @@ def remove_service(service_id):
 def pause_service_containers(service_name, worker_node_address):
     service = client.services.list(filters={"name": service_name})[0]
     service_containers = service.tasks()
+    service_state = ""
 
     for container in service_containers:
-        if container["Status"]["State"] == "pending":
+        if container["Status"]["State"] == "complete":
+            return
+
+        if container["Status"]["State"] != "running":
             remove_service(service.id)
             logging.info(f"Service {service_name} removed.")
+            service_state = "new"
         else:
             container_command = dict()
             container_command["id"] = container["Status"]["ContainerStatus"][
@@ -214,24 +222,32 @@ def pause_service_containers(service_name, worker_node_address):
             ]
             container_command["command"] = "pause"
             __send_message(container_command, worker_node_address)
+            service_state = "paused"
             logging.info(f"Service {service_name} paused.")
 
     running_services_lock.acquire()
     if service_name in running_services:
+        sched_queue_lock.acquire()
+        running_services[service_name]["service_state"] = service_state
+        sched_queue.append(running_services[service_name])
+        sched_queue_lock.release()
         del running_services[service_name]
     running_services_lock.release()
-    print(running_services.keys())
 
 
-def unpause_service_containers(service_id):
-    service_containers = client.services.get(service_id).tasks()
+def unpause_service_containers(task_request):
+    service_name = task_request["task_name"]
+    worker_node_address = task_request["work_node_ip"]
+
+    service = client.services.list(filters={"name": service_name})[0]
+    service_containers = service.tasks()
     for container in service_containers:
         container_command = dict()
         container_command["id"] = container["Status"]["ContainerStatus"]["ContainerID"]
         container_command["command"] = "unpause"
-        __send_message(container_command)
+        __send_message(container_command, worker_node_address)
 
-    logging.info(f"Service {service_id} unpaused.")
+    logging.info(f"Service {service_name} unpaused.")
 
 
 def __send_message(container_command, host):
@@ -252,9 +268,12 @@ def sched_service(worker_nodes, service_limit, task_request, worker_node_address
     )
 
     if work_node:
-        service = create_service(service_name, work_node, task_request)
+        service = create_service(
+            service_name, work_node, task_request, worker_node_addresses
+        )
     else:
         sched_queue_lock.acquire()
+        task_request["service_state"] = "new"
         sched_queue.append(task_request)
         sched_queue_lock.release()
         logging.info(f"Cluster is busy, Service {service_name} was added to the queue")
@@ -263,28 +282,51 @@ def sched_service(worker_nodes, service_limit, task_request, worker_node_address
 def remove_service_thread(thread, config_data):
     worker_nodes = config_data["nodes"]["worker_nodes"]
     service_limit = config_data["nodes"]["service_limit"]
+    worker_node_addresses = config_data["nodes"]["ip_address"]
 
     while True:
         for service in client.services.list():
-            if service.tasks(filters={"desired-state": ["shutdown"]}):
-                logging.info(f"service stoped: {service.name}")
+            try:
+                if service.tasks(filters={"desired-state": ["shutdown"]}):
+                    logging.info(f"service stoped: {service.name}")
 
-                running_services_lock.acquire()
-                if service.name in running_services:
-                    del running_services[service.name]
-                running_services_lock.release()
-                print(running_services.keys())
+                    running_services_lock.acquire()
+                    if service.name in running_services:
+                        del running_services[service.name]
+                    running_services_lock.release()
 
-                remove_service(service.id)
-                if sched_queue:
                     sched_queue_lock.acquire()
-                    task_request = sched_queue.popleft()
+                    for item in sched_queue:
+                        if "task_name" in item and item["task_name"] == service.name:
+                            sched_queue.remove(item)
+                            logging.warning(
+                                f"Service {service.name} removed from deque."
+                            )
+                            break
                     sched_queue_lock.release()
 
-                    logging.info(
-                        f"Creating a service from the sched queue: {task_request['task_name']}"
-                    )
-                    sched_service(worker_nodes, service_limit, task_request)
+                    remove_service(service.id)
+                    if sched_queue:
+                        sched_queue_lock.acquire()
+                        task_request = sched_queue.popleft()
+                        sched_queue_lock.release()
+                        if task_request["service_state"] == "new":
+                            logging.info(
+                                f"Creating a service from the sched queue: {task_request['task_name']}"
+                            )
+                            sched_service(
+                                worker_nodes,
+                                service_limit,
+                                task_request,
+                                worker_node_addresses,
+                            )
+                        else:
+                            logging.info(
+                                f"Unpause a service from the sched queue: {task_request['task_name']}"
+                            )
+                            unpause_service_containers(task_request)
+            except:
+                pass
         time.sleep(0.1)
 
 
