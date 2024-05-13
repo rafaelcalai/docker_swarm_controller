@@ -4,7 +4,6 @@ import threading
 import time
 import socket
 import json
-from collections import deque
 from copy import deepcopy
 
 client = docker.from_env()
@@ -15,7 +14,7 @@ logging.basicConfig(
 running_services = dict()
 running_services_lock = threading.Lock()
 
-sched_queue = deque()
+sched_queue = list()
 sched_queue_lock = threading.Lock()
 
 
@@ -202,6 +201,18 @@ def remove_service(service_id):
         logging.error(f"Service {service_id} not found.")
 
 
+def add_sched_waiting_queue(task):
+    index = 0
+    sched_queue_lock.acquire()
+    for service in sched_queue:
+        if service["priority"] > task["priority"]:
+            break
+        index += 1
+
+    sched_queue.insert(index, task)
+    sched_queue_lock.release()
+
+
 def pause_service_containers(service_name, worker_node_address):
     service = client.services.list(filters={"name": service_name})[0]
     service_containers = service.tasks()
@@ -227,10 +238,8 @@ def pause_service_containers(service_name, worker_node_address):
 
     running_services_lock.acquire()
     if service_name in running_services:
-        sched_queue_lock.acquire()
         running_services[service_name]["service_state"] = service_state
-        sched_queue.append(running_services[service_name])
-        sched_queue_lock.release()
+        add_sched_waiting_queue(running_services[service_name])
         del running_services[service_name]
     running_services_lock.release()
 
@@ -272,10 +281,9 @@ def sched_service(worker_nodes, service_limit, task_request, worker_node_address
             service_name, work_node, task_request, worker_node_addresses
         )
     else:
-        sched_queue_lock.acquire()
         task_request["service_state"] = "new"
-        sched_queue.append(task_request)
-        sched_queue_lock.release()
+        add_sched_waiting_queue(task_request)
+
         logging.info(f"Cluster is busy, Service {service_name} was added to the queue")
 
 
@@ -308,7 +316,7 @@ def remove_service_thread(thread, config_data):
                     remove_service(service.id)
                     if sched_queue:
                         sched_queue_lock.acquire()
-                        task_request = sched_queue.popleft()
+                        task_request = sched_queue.pop(0)
                         sched_queue_lock.release()
                         if task_request["service_state"] == "new":
                             logging.info(
