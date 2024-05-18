@@ -197,6 +197,7 @@ def remove_service(service_id):
     try:
         service = client.services.get(service_id)
         service.remove()
+        logging.info(f"Service {service.name} removed from Swarm cluster")
     except docker.errors.NotFound:
         logging.error(f"Service {service_id} not found.")
 
@@ -293,31 +294,43 @@ def remove_service_thread(thread, config_data):
     worker_node_addresses = config_data["nodes"]["ip_address"]
 
     while True:
-        for service in client.services.list():
+        swarm_services = client.services.list()
+        for service in swarm_services:
             try:
                 if service.tasks(filters={"desired-state": ["shutdown"]}):
-                    logging.info(f"service stoped: {service.name}")
+                    logging.info(f"Service stopped: {service.name}")
 
+                    free_node = None
                     running_services_lock.acquire()
                     if service.name in running_services:
+                        free_node = running_services[service.name]["work_node"]
                         del running_services[service.name]
                     running_services_lock.release()
 
                     sched_queue_lock.acquire()
                     for item in sched_queue:
                         if "task_name" in item and item["task_name"] == service.name:
+                            free_node = item["work_node"]
                             sched_queue.remove(item)
-                            logging.warning(
-                                f"Service {service.name} removed from deque."
-                            )
+                            logging.warning(f"Service {service.name} removed from deque.")
                             break
                     sched_queue_lock.release()
 
                     remove_service(service.id)
+
+                    sched_queue_lock.acquire()
+                    task_request = None
                     if sched_queue:
-                        sched_queue_lock.acquire()
-                        task_request = sched_queue.pop(0)
-                        sched_queue_lock.release()
+                        for index, task in enumerate(sched_queue):
+                            if task["service_state"] == "new":
+                                task_request = sched_queue.pop(index)
+                                break
+                            elif task["work_node"] == free_node:
+                                task_request = sched_queue.pop(index)
+                                break
+                    sched_queue_lock.release()
+
+                    if task_request:
                         if task_request["service_state"] == "new":
                             logging.info(
                                 f"Creating a service from the sched queue: {task_request['task_name']}"
@@ -333,8 +346,9 @@ def remove_service_thread(thread, config_data):
                                 f"Unpause a service from the sched queue: {task_request['task_name']}"
                             )
                             unpause_service_containers(task_request)
-            except:
-                pass
+            except Exception as error:
+                logging.error("In remoce service an exception occurred:", type(error).__name__)
+                    
         time.sleep(0.1)
 
 

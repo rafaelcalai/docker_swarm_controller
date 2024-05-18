@@ -9,7 +9,7 @@
         ],
         "service_limit": {
             "rpi5-node01": 3,
-            "rpi3-node02": 2
+            "rpi3-node02": 3
         },
         "ip_address": {
             "rpi5-node01": "192.168.1.112",
