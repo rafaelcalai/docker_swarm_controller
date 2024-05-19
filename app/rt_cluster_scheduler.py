@@ -5,6 +5,7 @@ import time
 import socket
 import json
 from copy import deepcopy
+from docker.errors import NotFound, APIError
 
 client = docker.from_env()
 logging.basicConfig(
@@ -297,6 +298,7 @@ def remove_service_thread(thread, config_data):
         swarm_services = client.services.list()
         for service in swarm_services:
             try:
+                service.reload()
                 if service.tasks(filters={"desired-state": ["shutdown"]}):
                     logging.info(f"Service stopped: {service.name}")
 
@@ -312,7 +314,9 @@ def remove_service_thread(thread, config_data):
                         if "task_name" in item and item["task_name"] == service.name:
                             free_node = item["work_node"]
                             sched_queue.remove(item)
-                            logging.warning(f"Service {service.name} removed from deque.")
+                            logging.warning(
+                                f"Service {service.name} removed from deque."
+                            )
                             break
                     sched_queue_lock.release()
 
@@ -346,9 +350,13 @@ def remove_service_thread(thread, config_data):
                                 f"Unpause a service from the sched queue: {task_request['task_name']}"
                             )
                             unpause_service_containers(task_request)
+            except NotFound:
+                logging.warning(f"Service {service.name} no longer exists, skipping.")
+            except APIError as api_err:
+                logging.error(f"API error occurred: {api_err}")
             except Exception as error:
-                logging.error("In remoce service an exception occurred:", type(error).__name__)
-                    
+                logging.error(f"In remove service an exception occurred: {error}")
+
         time.sleep(0.1)
 
 
