@@ -6,6 +6,7 @@ import socket
 import json
 from copy import deepcopy
 from docker.errors import NotFound, APIError
+from datetime import datetime, timedelta
 
 client = docker.from_env()
 logging.basicConfig(
@@ -14,6 +15,9 @@ logging.basicConfig(
 
 running_services = dict()
 running_services_lock = threading.Lock()
+
+pending_services = list()
+pending_services_lock = threading.Lock()
 
 sched_queue = list()
 sched_queue_lock = threading.Lock()
@@ -102,7 +106,10 @@ def pause_lower_priority_service(task_priority, worker_node_addresses):
     available_worker_node = ""
     lowest_priority = task_priority
     for service in copy_running_services:
-        if copy_running_services[service]["priority"] > lowest_priority:
+        if (
+            copy_running_services[service]["priority"] > lowest_priority
+            and copy_running_services[service]["service_state"] == "running"
+        ):
             lowest_priority = copy_running_services[service]["priority"]
             lowest_priority_service = service
             available_worker_node = copy_running_services[service]["work_node"]
@@ -158,7 +165,7 @@ def create_service(
     command = [
         "python",
         "wait_for_value.py",
-        str(task_request["ecxecution_time"]),
+        str(task_request["execution_time"]),
         service_name,
     ]
     secrets = secrets or []
@@ -175,6 +182,7 @@ def create_service(
     task_request["work_node"] = work_node
     task_request["service_state"] = "new"
     task_request["work_node_ip"] = worker_node_addresses[work_node]
+    task_request["service_started"] = datetime.now()
 
     running_services_lock.acquire()
     running_services[service_name] = task_request
@@ -273,6 +281,13 @@ def __send_message(container_command, host):
 
 def sched_service(worker_nodes, service_limit, task_request, worker_node_addresses):
     service_name = task_request["task_name"]
+    task_request["date_deadline"] = datetime.now() + timedelta(
+        seconds=task_request["deadline"]
+    )
+    task_request["sched_deadline"] = task_request["date_deadline"] - timedelta(
+        seconds=task_request["execution_time"]
+    )
+    task_request["service_started"] = 0
 
     work_node = check_schedulability(
         worker_nodes, service_limit, task_request, worker_node_addresses
@@ -282,11 +297,42 @@ def sched_service(worker_nodes, service_limit, task_request, worker_node_address
         service = create_service(
             service_name, work_node, task_request, worker_node_addresses
         )
+
+        pending_services_lock.acquire()
+        pending_services.append(service)
+        pending_services_lock.release()
+
     else:
         task_request["service_state"] = "new"
         add_sched_waiting_queue(task_request)
 
         logging.info(f"Cluster is busy, Service {service_name} was added to the queue")
+
+
+def service_monitor_thread(thread):
+    while True:
+        if pending_services:
+            pending_services_lock.acquire()
+            pending_services_copy = pending_services
+            pending_services_lock.release()
+
+            for service in pending_services_copy:
+                tasks = service.tasks()
+                for task in tasks:
+                    if task["Status"]["State"] == "running":
+                        pending_services_lock.acquire()
+                        pending_services.remove(service)
+                        pending_services_lock.release()
+
+                        running_services_lock.acquire()
+                        running_services[service.name]["service_state"] = "running"
+                        running_services_lock.release()
+
+                        logging.info(
+                            f"Service {service.name} container is {task['Status']['State']}"
+                        )
+
+        time.sleep(0.1)
 
 
 def remove_service_thread(thread, config_data):
@@ -377,7 +423,7 @@ def listen_service_request(thread, config_data):
 
     while True:
         connection, addr = server.accept()
-        logging.info(f"Connetion from {addr}")
+        logging.debug(f"Connetion from {addr}")
 
         while True:
             data = connection.recv(1024)
@@ -394,17 +440,21 @@ def main():
     with open("config.json", encoding="utf-8") as f:
         config_data = json.load(f)
 
-    monitor_thread = threading.Thread(
+    remove_services_thread = threading.Thread(
         target=remove_service_thread, args=(1, config_data)
     )
     server_thread = threading.Thread(
-        target=listen_service_request, args=(1, config_data)
+        target=listen_service_request, args=(2, config_data)
     )
-    monitor_thread.start()
-    server_thread.start()
+    monitor_serices_thread = threading.Thread(target=service_monitor_thread, args=(3,))
 
-    monitor_thread.join()
+    remove_services_thread.start()
+    server_thread.start()
+    monitor_serices_thread.start()
+
+    remove_services_thread.join()
     server_thread.join()
+    monitor_serices_thread.join()
 
 
 if __name__ == "__main__":
