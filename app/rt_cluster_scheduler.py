@@ -102,6 +102,13 @@ def available_worker_node(available_worker_nodes, services_associated, service_l
     return least_work_node
 
 
+def update_sched_deadline(service):
+    old_sched_deadline = running_services[service]["sched_deadline"]
+    executed_time = datetime.now() - running_services[service]["service_started"]
+    new_sched_deadline = old_sched_deadline + executed_time
+    running_services[service]["sched_deadline"] = new_sched_deadline
+
+
 def pause_lower_priority_service(task_priority, worker_node_addresses):
     running_services_lock.acquire()
     copy_running_services = deepcopy(running_services)
@@ -123,7 +130,6 @@ def pause_lower_priority_service(task_priority, worker_node_addresses):
         pause_service_containers(
             lowest_priority_service, worker_node_addresses[available_worker_node]
         )
-
     return available_worker_node
 
 
@@ -247,13 +253,13 @@ def pause_service_containers(service_name, worker_node_address):
                 "ContainerID"
             ]
             container_command["command"] = "pause"
-            __send_message(container_command, worker_node_address)
             service_state = "paused"
             logging.info(f"Service {service_name} paused.")
 
     running_services_lock.acquire()
     if service_name in running_services:
         running_services[service_name]["service_state"] = service_state
+        update_sched_deadline(service_name)
         add_sched_waiting_queue(running_services[service_name])
         del running_services[service_name]
     running_services_lock.release()
@@ -269,12 +275,16 @@ def unpause_service_containers(task_request):
         container_command = dict()
         container_command["id"] = container["Status"]["ContainerStatus"]["ContainerID"]
         container_command["command"] = "unpause"
-        __send_message(container_command, worker_node_address)
+        send_message(container_command, worker_node_address)
 
+    task_request["service_started"] = datetime.now()
+    running_services_lock.acquire()
+    running_services[service_name] = task_request
+    running_services_lock.release()
     logging.info(f"Service {service_name} unpaused.")
 
 
-def __send_message(container_command, host):
+def send_message(container_command, host):
     client_socket = socket.socket()
     client_socket.connect((host, 8770))
 
@@ -402,7 +412,7 @@ def service_request_thread(thread):
                 break
 
 
-def cluster_scheduler_thread(thrread, config_data):
+def cluster_scheduler_thread(thread, config_data):
     worker_nodes = config_data["nodes"]["worker_nodes"]
     service_limit = config_data["nodes"]["service_limit"]
     worker_node_addresses = config_data["nodes"]["ip_address"]
@@ -446,6 +456,9 @@ def cluster_scheduler_thread(thrread, config_data):
 def main():
     with open("config.json", encoding="utf-8") as f:
         config_data = json.load(f)
+
+    # Remove all serivces
+    # Start pause/unpause services in the cluster
 
     remove_services_thread = threading.Thread(target=remove_service_thread, args=(1,))
     request_server_thread = threading.Thread(target=service_request_thread, args=(2,))
