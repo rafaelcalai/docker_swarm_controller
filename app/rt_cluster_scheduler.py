@@ -20,11 +20,53 @@ running_services_lock = threading.Lock()
 pending_services = list()
 pending_services_lock = threading.Lock()
 
+
 sched_queue = list()
 sched_queue_lock = threading.Lock()
 
 sched_event = threading.Semaphore(0)
 
+def remove_all_services():
+    services = client.services.list()
+
+    if not services:
+        logging.info("No services to remove.")
+        return
+    
+    for service in services:
+        logging.info(f'Removing service: {service.name}')
+        service.remove()
+
+    logging.info("All services have been removed.")
+
+def create_pause_unpause_services(worker_nodes):
+
+    available_nodes = get_available_worker_nodes(worker_nodes)
+    
+    image = "rafaelcalai633/pause_unpause_container:1.0.0"
+    replicas = 1
+    entrypoint = ["python3", "/app/pause_unpause_container.py"]
+    restart_policy = docker.types.RestartPolicy(condition='any')
+    
+    endpoint_spec = docker.types.EndpointSpec(
+        mode='vip',
+        ports={8770: (8770, 'tcp', 'host')}
+    )
+
+    for node in available_nodes:
+        service_name = f"pause_unpause_containers_{node}"
+        constraints = [f"node.hostname == {node}"]
+        client.services.create(
+            name=service_name,
+            image=image,
+            command=entrypoint,
+            constraints=constraints,
+            mode=docker.types.ServiceMode('replicated', replicas=replicas),
+            restart_policy=restart_policy,
+            mounts=[docker.types.Mount(target='/var/run/docker.sock', source='/var/run/docker.sock', type='bind')],
+            endpoint_spec=endpoint_spec
+        )
+        logging.info(f'Service {service_name} created successfully.')
 
 def get_node_info():
     nodes = client.nodes.list()
@@ -230,7 +272,7 @@ def add_sched_waiting_queue(task):
     sched_queue.insert(index, task)
     queue_size = len(sched_queue)
     sched_queue_lock.release()
-    return index, queue_size
+    return index + 1, queue_size
 
 
 def pause_service_containers(service_name, worker_node_address, available_worker_node):
@@ -467,8 +509,8 @@ def main():
     with open("config.json", encoding="utf-8") as f:
         config_data = json.load(f)
 
-    # Remove all serivces
-    # Start pause/unpause services in the cluster
+    remove_all_services()
+    create_pause_unpause_services(config_data["nodes"]["worker_nodes"])
 
     remove_services_thread = threading.Thread(target=remove_service_thread, args=(1,))
     request_server_thread = threading.Thread(target=service_request_thread, args=(2,))
