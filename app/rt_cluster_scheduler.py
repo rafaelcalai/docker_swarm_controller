@@ -149,11 +149,10 @@ def update_sched_deadline(service):
     running_services[service]["sched_deadline"] = new_sched_deadline
 
 
-def pause_lower_priority_service(task_sched_deadline, worker_node_addresses, action):
+def pause_lower_priority_service(task_sched_deadline, worker_node_addresses):
     lowest_priority_service = ""
     available_worker_node = ""
     lowest_sched_deadline_priority = task_sched_deadline
-    if action: running_services_lock.acquire()
     for service in running_services:
         if (
             running_services[service]["sched_deadline"]
@@ -165,13 +164,7 @@ def pause_lower_priority_service(task_sched_deadline, worker_node_addresses, act
             ]
             lowest_priority_service = service
             available_worker_node = running_services[service]["work_node"]
-    if action: 
-        running_services_lock.release()
-        if available_worker_node:
-            pause_service_containers(
-                lowest_priority_service, worker_node_addresses[available_worker_node], available_worker_node
-            )
-    return available_worker_node
+    return available_worker_node, lowest_priority_service
 
 
 def load_balance(
@@ -180,32 +173,31 @@ def load_balance(
     service_limit,
     task_request,
     worker_node_addresses,
-    action
 ):
+    pause_service = None
     worker_node = available_worker_node(
         available_worker_nodes, services_associated, service_limit
     )
     if worker_node == "":
-        worker_node = pause_lower_priority_service(
-            task_request["sched_deadline"], worker_node_addresses, action
+        worker_node, pause_service  = pause_lower_priority_service(
+            task_request["sched_deadline"], worker_node_addresses
         )
-    return worker_node
+    return worker_node, pause_service
 
 
 def check_schedulability(
-    worker_nodes, service_limit, task_request, worker_node_addresses, action=True
+    worker_nodes, service_limit, task_request, worker_node_addresses
 ):
     available_worker_nodes = get_available_worker_nodes(worker_nodes)
     services_associated = get_worker_nodes_load(available_worker_nodes)
-    work_node = load_balance(
+    work_node, pause_service = load_balance(
         available_worker_nodes,
         services_associated,
         service_limit,
         task_request,
         worker_node_addresses,
-        action
     )
-    return work_node
+    return work_node, pause_service
 
 
 def create_service(
@@ -354,10 +346,6 @@ def send_message(container_command, host):
 def sched_service(worker_nodes, service_limit, task_request, worker_node_addresses, work_node):
     service_name = task_request["task_name"]
 
-    work_node = check_schedulability(
-        worker_nodes, service_limit, task_request, worker_node_addresses
-    )
-
     if work_node:
         service = create_service(
             service_name, work_node, task_request, worker_node_addresses
@@ -483,13 +471,17 @@ def cluster_scheduler_thread(thread, config_data):
             task_request = None
             if sched_queue:
                 for index, task in enumerate(sched_queue):
-                    work_node = check_schedulability(worker_nodes, service_limit, task, worker_node_addresses, action=False)
-                    if task["service_state"] == "new" or work_node:
+                    work_node, pause_service = check_schedulability(worker_nodes, service_limit, task, worker_node_addresses)
+                    if work_node:
                         task_request = sched_queue.pop(index)
                         break
             sched_queue_lock.release()
 
-            if task_request:
+            if task_request: 
+                if pause_service:
+                    pause_service_containers(
+                        pause_service, worker_node_addresses[work_node], work_node
+                    )
                 if task_request["service_state"] == "new":
                     sched_service(
                         worker_nodes,
